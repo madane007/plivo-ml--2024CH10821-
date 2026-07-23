@@ -86,6 +86,9 @@ def main():
     ap.add_argument("--mlp_ratio", type=float, default=4.0)
     ap.add_argument("--init_std", type=float, default=0.02)
     ap.add_argument("--tie_weights", type=int, default=1)
+    ap.add_argument("--qk_norm", type=int, default=0)
+    ap.add_argument("--ema_decay", type=float, default=0.999,
+                    help="0 disables; else keep an EMA of weights and score it")
     args = ap.parse_args()
     assert args.steps <= MAX_STEPS, f"cap: max {MAX_STEPS} steps"
     torch.manual_seed(args.seed)
@@ -103,6 +106,7 @@ def main():
               "pos_type", "norm_type", "mlp_type", "mlp_ratio", "init_std"):
         setattr(cfg, k, getattr(args, k))
     cfg.tie_weights = bool(args.tie_weights)
+    cfg.qk_norm = bool(args.qk_norm)
     model = GPT(cfg).to(device)
     n = model.n_params()
     n_ne = model.n_params_non_embedding()
@@ -125,6 +129,11 @@ def main():
         model.train()
         return bpb
 
+    # EMA of weights (free readout improvement; no extra optimizer steps)
+    ema = None
+    if args.ema_decay > 0:
+        ema = {n: p.detach().clone() for n, p in model.named_parameters()}
+
     model.train()
     t0 = time.time()
     losses = []
@@ -139,6 +148,11 @@ def main():
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
+        if ema is not None:
+            d = args.ema_decay
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    ema[n].mul_(d).add_(p.detach(), alpha=1 - d)
         losses.append(loss.item())
         if step % args.log_every == 0 or step == 1:
             avg = sum(losses[-args.log_every:]) / len(losses[-args.log_every:])
@@ -150,18 +164,34 @@ def main():
             print(f"    [dev] step {step}: bpb {b:.4f}  (best {best_bpb:.4f})",
                   flush=True)
 
-    torch.save({"model": model.state_dict(),
+    # choose the weights to save: EMA if it scores better on dev, else raw
+    raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    raw_bpb = score_dev() if dev_text is not None else None
+    save_state, tag = raw_state, "raw"
+    ema_bpb = None
+    if ema is not None and dev_text is not None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                p.copy_(ema[n])
+        ema_bpb = score_dev()
+        if ema_bpb <= raw_bpb:
+            save_state = {k: v.detach().clone()
+                          for k, v in model.state_dict().items()}
+            tag = "ema"
+        # restore raw into the live model (params are mutated in-place above)
+        model.load_state_dict(raw_state)
+
+    torch.save({"model": save_state,
                 "config": {k: getattr(cfg, k) for k in dir(cfg)
                            if not k.startswith("_")
                            and not callable(getattr(cfg, k))},
                 "steps": args.steps,
                 "train_loss_curve": losses}, args.out)
-    final_bpb = score_dev() if dev_text is not None else None
-    msg = f"saved {args.out}  ({time.time()-t0:.0f}s total)"
-    if final_bpb is not None:
-        msg += f"  final dev bpb {final_bpb:.4f}"
-        if best_bpb is not None:
-            msg += f"  (best {best_bpb:.4f})"
+    msg = f"saved {args.out} [{tag}]  ({time.time()-t0:.0f}s total)"
+    if raw_bpb is not None:
+        msg += f"  raw bpb {raw_bpb:.4f}"
+    if ema_bpb is not None:
+        msg += f"  ema bpb {ema_bpb:.4f}"
     print(msg, flush=True)
 
 

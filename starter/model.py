@@ -30,6 +30,7 @@ class Config:
     mlp_type = "swiglu"        # "swiglu" | "gelu"
     mlp_ratio = 4.0            # hidden size = mlp_ratio * n_embd (pre-SwiGLU 2/3 adj)
     init_std = 0.02
+    qk_norm = False            # RMSNorm on per-head q,k before attention
 
 
 class RMSNorm(nn.Module):
@@ -79,6 +80,10 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         self.drop = nn.Dropout(cfg.dropout)
         self.dropout_p = cfg.dropout
+        self.qk_norm = getattr(cfg, "qk_norm", False)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
         if self.use_rope:
             cos, sin = build_rope_cache(cfg.block_size, self.head_dim)
             self.register_buffer("rope_cos", cos, persistent=False)
@@ -90,6 +95,9 @@ class SelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         if self.use_rope:
             q = apply_rope(q, self.rope_cos, self.rope_sin)
             k = apply_rope(k, self.rope_cos, self.rope_sin)
